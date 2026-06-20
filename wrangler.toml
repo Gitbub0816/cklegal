@@ -1,3 +1,7 @@
 name = "cklegal"
 compatibility_date = "2026-06-20"
 pages_build_output_dir = "dist"
+
+[vars]
+PUBLIC_CONSENT_BASE_URL = "https://legal.clearkey.solutions"
+SMS_WEBHOOK_URL = "https://api.clearkey.solutions/sms/send"
