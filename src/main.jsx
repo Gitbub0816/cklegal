@@ -12,6 +12,7 @@ const aliases = {
   "/sms-opt-in": "/policy/sms-policy/opt-in",
   "/unsubscribe": "/policy/sms-policy/unsubscribe",
   "/sms-unsubscribe": "/policy/sms-policy/unsubscribe",
+  "/sms/unsubscribe": "/sms/unsubscribe",
   "/consent": "/consent-center",
   "/cookie-consent": "/cookie-consent-banner-text"
 };
@@ -35,8 +36,10 @@ function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  if (path === "/policy/sms-policy/opt-in") return <SmsForm mode="opt-in" />;
-  if (path === "/policy/sms-policy/unsubscribe") return <SmsForm mode="unsubscribe" />;
+  const verificationMatch = path.match(/^\/sms\/verify\/([^/]+)$/);
+  if (verificationMatch) return <SmsVerification token={decodeURIComponent(verificationMatch[1])} />;
+  if (path === "/policy/sms-policy/opt-in") return <LegacySmsStart />;
+  if (path === "/policy/sms-policy/unsubscribe" || path === "/sms/unsubscribe") return <SmsUnsubscribe />;
   if (path === "/policy/sms-policy/policy") return <SmsPolicy />;
   if (path === "/consent-center") return <ConsentCenter />;
   if (path === "/") return <Hub />;
@@ -201,56 +204,179 @@ function PolicyDocument({ policy }) {
   );
 }
 
-function SmsForm({ mode }) {
-  const isUnsub = mode === "unsubscribe";
+function addConsentStatus(returnUrl, status) {
+  if (!returnUrl) return "/";
+  const url = new URL(returnUrl);
+  url.searchParams.set("smsConsent", status);
+  return url.toString();
+}
+
+function LegacySmsStart() {
+  return (
+    <>
+      <Header back />
+      <main className="formPage">
+        <section className="formCard">
+          <p className="eyebrow">SMS Communications</p>
+          <h1>Start from your ClearKey app</h1>
+          <p className="formIntro">Enter your phone number in the ClearKey-powered app requesting consent. We will send a secure verification link that returns you to that app after confirmation.</p>
+          <button type="button" onClick={() => navigate("/")}>Return to Legal Center</button>
+        </section>
+      </main>
+      <Footer />
+    </>
+  );
+}
+
+function SmsVerification({ token }) {
   const params = new URLSearchParams(window.location.search);
-  const token = params.get("token") || "";
-  const tenantSlug = params.get("tenant") || params.get("tenantSlug") || "clearkey";
-  const source = params.get("source") || "consent-center";
-  const [phone, setPhone] = useState("");
-  const [code, setCode] = useState("");
+  const popupRequested = params.get("popup") === "1";
   const [requestInfo, setRequestInfo] = useState(null);
+  const [consent, setConsent] = useState(false);
   const [done, setDone] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
 
   React.useEffect(() => {
-    if (isUnsub || !token) return;
-    setBusy(true);
     fetch("/api/sms/lookup-verification", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token })
+      body: JSON.stringify({ token }),
     })
-      .then(async (res) => {
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || !data.ok) throw new Error(data.error || "Verification lookup failed");
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) throw new Error(data.error || "Verification lookup failed");
         setRequestInfo(data.request);
       })
-      .catch((err) => setError(err.message))
+      .catch((lookupError) => setError(lookupError.message))
       .finally(() => setBusy(false));
-  }, [isUnsub, token]);
+  }, [token]);
 
-  async function submit(e) {
-    e.preventDefault();
+  function finish(status, info = requestInfo) {
+    if (!info) return;
+    const popup = popupRequested || info.popupRequested;
+    if (popup && window.opener && info.allowedReturnOrigin) {
+      window.opener.postMessage(
+        {
+          type: "CLEARKEY_SMS_CONSENT_COMPLETE",
+          status,
+          app: info.app,
+          tenantSlug: info.tenantSlug,
+          purpose: info.purpose,
+        },
+        info.allowedReturnOrigin,
+      );
+      window.close();
+    }
+    window.location.replace(addConsentStatus(info.returnUrl, status));
+  }
+
+  async function submit(event) {
+    event.preventDefault();
     setBusy(true);
     setError("");
     try {
-      const endpoint = isUnsub ? "/api/sms/unsubscribe" : "/api/sms/verify-opt-in";
-      const payload = isUnsub ? { phone, tenantSlug, source } : { token, code };
-      const res = await fetch(endpoint, {
+      const response = await fetch("/api/sms/verify-opt-in", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ token, consent }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "Request failed");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || "Request failed");
       setDone(true);
-      if (!isUnsub && data.returnTo) {
-        setTimeout(() => { window.location.href = data.returnTo; }, 1200);
-      }
-    } catch (err) {
-      setError(err.message);
+      setTimeout(() => finish("opted_in", { ...requestInfo, ...data }), 450);
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const content = (
+    <main className={`formPage ${popupRequested ? "popupPage" : ""}`}>
+      <section className="formCard">
+        <p className="eyebrow">SMS Communications</p>
+        <h1>Confirm SMS Consent</h1>
+        {done ? (
+          <div className="success">
+            <div className="check">OK</div>
+            <h2>SMS opt-in confirmed</h2>
+            <p>Your consent was recorded. Returning you to {requestInfo?.app || "the requesting app"}.</p>
+          </div>
+        ) : (
+          <form onSubmit={submit}>
+            <p className="formIntro">Review the request below. Your phone number was already provided to the requesting app and is not displayed here.</p>
+            {busy && !requestInfo && <div className="notice">Loading verification request...</div>}
+            {requestInfo && (
+              <dl className="consentContext">
+                <div><dt>App</dt><dd>{requestInfo.app}</dd></div>
+                <div><dt>Tenant</dt><dd>{requestInfo.tenantSlug}</dd></div>
+                <div><dt>Purpose</dt><dd>{requestInfo.purpose?.replaceAll("_", " ")}</dd></div>
+              </dl>
+            )}
+            <label className="consentCheck">
+              <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} required />
+              <span>{requestInfo?.consentText || "I agree to receive SMS messages from ClearKey Solutions and the relevant ClearKey-powered app. Message frequency varies. Message and data rates may apply. Reply STOP to unsubscribe."}</span>
+            </label>
+            {error && <div className="notice error">{error}</div>}
+            <button type="submit" disabled={busy || !requestInfo || !consent}>{busy ? "Working..." : "Confirm Opt-In"}</button>
+            <button type="button" className="linkBtn" disabled={!requestInfo} onClick={() => finish("failed")}>Cancel</button>
+          </form>
+        )}
+      </section>
+    </main>
+  );
+  if (popupRequested) return content;
+  return <><Header back />{content}<Footer /></>;
+}
+
+function SmsUnsubscribe() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token") || "";
+  const app = params.get("app") || "connect";
+  const tenantSlug = params.get("tenantSlug") || "clearkey";
+  const purpose = params.get("purpose") || "marketing_sms";
+  const returnUrl = params.get("returnUrl") || "";
+  const [phone, setPhone] = useState("");
+  const [tokenKnown, setTokenKnown] = useState(Boolean(token));
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(Boolean(token));
+  const [error, setError] = useState("");
+
+  React.useEffect(() => {
+    if (!token) return;
+    fetch("/api/sms/lookup-verification", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    })
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) throw new Error("Enter the phone number to unsubscribe.");
+        setTokenKnown(true);
+      })
+      .catch((lookupError) => {
+        setTokenKnown(false);
+        setError(lookupError.message);
+      })
+      .finally(() => setBusy(false));
+  }, [token]);
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/sms/unsubscribe", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: tokenKnown ? token : undefined, phone, app, tenantSlug, purpose, returnUrl: returnUrl || undefined }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || "Unsubscribe failed");
+      setDone(true);
+    } catch (submitError) {
+      setError(submitError.message);
     } finally {
       setBusy(false);
     }
@@ -262,34 +388,24 @@ function SmsForm({ mode }) {
       <main className="formPage">
         <section className="formCard">
           <p className="eyebrow">SMS Communications</p>
-          <h1>{isUnsub ? "Unsubscribe from SMS" : "Confirm SMS Opt-In"}</h1>
+          <h1>Unsubscribe</h1>
           {done ? (
             <div className="success">
-              <div className="check">✓</div>
-              <h2>{isUnsub ? "Unsubscribe request received" : "SMS opt-in confirmed"}</h2>
-              <p>{isUnsub ? "We recorded your unsubscribe request in ClearKey's consent database. Optional SMS messages will stop for that number." : "Your verification code was accepted and your SMS consent was recorded."}</p>
-              <button onClick={() => navigate("/")}>Return to Legal Center</button>
+              <div className="check">OK</div>
+              <h2>You are unsubscribed</h2>
+              <p>ClearKey recorded your opt-out for {app} and {tenantSlug}.</p>
+              <button onClick={() => window.location.replace(returnUrl ? addConsentStatus(returnUrl, "opted_out") : "/")}>Continue</button>
             </div>
           ) : (
             <form onSubmit={submit}>
-              {isUnsub ? (
-                <>
-                  <p className="formIntro">Enter the phone number you want removed from optional ClearKey SMS communications.</p>
-                  <label>Mobile phone number<input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="(555) 000-0000" required /></label>
-                </>
-              ) : (
-                <>
-                  <p className="formIntro">This opt-in page is opened after another ClearKey app has already collected your phone number and sent a verification code.</p>
-                  {!token && <div className="notice error">Missing verification token. Start from the app where you entered your phone number.</div>}
-                  {busy && !requestInfo && <div className="notice">Loading verification request…</div>}
-                  {requestInfo && <div className="notice">Verification for <strong>{requestInfo.phone_mask}</strong></div>}
-                  <label>Verification code<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="123456" required /></label>
-                  <p className="fineprint">{requestInfo?.consent_language || `By submitting this code, you expressly consent to receive ClearKey text messages. Consent is not a condition of purchase. Message frequency varies. Message and data rates may apply. Reply STOP to cancel.`}</p>
-                </>
-              )}
+              <p className="formIntro">Stop optional SMS messages for this app and tenant.</p>
+              <dl className="consentContext">
+                <div><dt>App</dt><dd>{app}</dd></div>
+                <div><dt>Tenant</dt><dd>{tenantSlug}</dd></div>
+              </dl>
+              {!tokenKnown && <label>Mobile phone number<input type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+1 555 123 4567" required /></label>}
               {error && <div className="notice error">{error}</div>}
-              <button type="submit" disabled={busy || (!isUnsub && !token)}>{busy ? "Working…" : isUnsub ? "Confirm Unsubscribe" : "Confirm Opt-In"}</button>
-              <button type="button" className="linkBtn" onClick={() => navigate("/policy/sms-policy/policy")}>View SMS Policy</button>
+              <button type="submit" disabled={busy}>{busy ? "Working..." : "Unsubscribe"}</button>
             </form>
           )}
         </section>

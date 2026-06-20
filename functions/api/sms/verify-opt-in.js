@@ -1,31 +1,82 @@
-import { ensureSchema, hashCode, json, options, readJson, requireDb } from '../_shared/consent.js';
+import {
+  allowedReturnOrigin,
+  errorJson,
+  ensureSchema,
+  json,
+  options,
+  readJson,
+  requestMetadata,
+  requireDb,
+  sha256,
+} from "../_shared/consent.js";
 
-export async function onRequestOptions() { return options(); }
+export function onRequestOptions({ request }) {
+  return options(request);
+}
 
 export async function onRequestPost({ request, env }) {
   try {
     const body = await readJson(request);
-    if (!body.token || !body.code) return json({ ok: false, error: 'Token and code are required' }, 400);
+    if (!body.token || body.consent !== true || String(body.token).length > 256) {
+      return json({ ok: false, error: "Consent confirmation is required" }, 400, request);
+    }
     const sql = requireDb(env);
     await ensureSchema(sql);
-    const rows = await sql`select * from sms_consent_requests where token = ${body.token} limit 1`;
-    if (!rows.length) return json({ ok: false, error: 'Verification request not found' }, 404);
-    const r = rows[0];
-    if (new Date(r.expires_at).getTime() < Date.now()) return json({ ok: false, error: 'Verification expired' }, 410);
-    if (r.status === 'verified') return json({ ok: true, status: 'verified', returnTo: r.return_to });
-    if (await hashCode(body.code) !== r.code_hash) return json({ ok: false, error: 'Invalid verification code' }, 400);
-
+    const tokenHash = await sha256(body.token);
+    const { ipAddress, userAgent } = requestMetadata(request);
+    const rows = await sql`
+      select * from sms_consent_requests
+      where verification_token_hash = ${tokenHash}
+      limit 1
+    `;
+    if (!rows.length || new Date(rows[0].token_expires_at).getTime() <= Date.now()) {
+      return json({ ok: false, error: "Verification request is invalid or expired" }, 410, request);
+    }
+    const record = rows[0];
+    if (record.consent_status === "opted_out") {
+      return json({ ok: false, error: "This number has been opted out" }, 409, request);
+    }
     await sql`
       update sms_consent_requests
-      set status = 'verified', verified_at = now()
-      where id = ${r.id}
+      set consent_status = 'opted_in', opted_in_at = coalesce(opted_in_at, now()), updated_at = now()
+      where id = ${record.id}
     `;
     await sql`
-      insert into sms_consent_events (request_id, tenant_slug, source, phone_e164, phone_mask, event_type, consent_language, ip_address, user_agent, metadata)
-      values (${r.id}, ${r.tenant_slug}, ${r.source}, ${r.phone_e164}, ${r.phone_mask}, 'sms_opt_in_verified', ${r.consent_language}, ${request.headers.get('cf-connecting-ip') || ''}, ${request.headers.get('user-agent') || ''}, ${JSON.stringify({ acceptedOnForm: true })}::jsonb)
+      insert into sms_consent_records
+        (phone_e164, app, tenant_slug, purpose, consent_status, consent_text_version,
+         ip_address, user_agent, opted_in_at, opted_out_at, updated_at)
+      values
+        (${record.phone_e164}, ${record.app}, ${record.tenant_slug}, ${record.purpose},
+         'opted_in', ${record.consent_text_version}, ${ipAddress}, ${userAgent}, now(), null, now())
+      on conflict (phone_e164, app, tenant_slug, purpose)
+      do update set consent_status = 'opted_in', consent_text_version = excluded.consent_text_version,
+                    ip_address = excluded.ip_address, user_agent = excluded.user_agent,
+                    opted_in_at = now(), opted_out_at = null, updated_at = now()
     `;
-    return json({ ok: true, status: 'verified', returnTo: r.return_to });
-  } catch (err) {
-    return json({ ok: false, error: err.message || 'Verification failed' }, 500);
+    await sql`
+      insert into sms_consent_events
+        (request_id, phone_e164, app, tenant_slug, purpose, event_type,
+         consent_status, consent_text_version, ip_address, user_agent, metadata)
+      values
+        (${record.id}, ${record.phone_e164}, ${record.app}, ${record.tenant_slug},
+         ${record.purpose}, 'sms_opted_in', 'opted_in', ${record.consent_text_version},
+         ${ipAddress}, ${userAgent}, ${JSON.stringify({ checkboxConfirmed: true })}::jsonb)
+    `;
+    return json(
+      {
+        ok: true,
+        status: "opted_in",
+        app: record.app,
+        tenantSlug: record.tenant_slug,
+        purpose: record.purpose,
+        popupRequested: record.popup_requested,
+        returnUrl: record.return_url,
+        allowedReturnOrigin: allowedReturnOrigin(record.return_url),
+      },
+      200,
+      request,
+    );
+  } catch (error) {
+    return errorJson(error, "Verification failed", request);
   }
 }

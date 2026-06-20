@@ -1,41 +1,84 @@
-import { ensureSchema, hashCode, json, makeCode, makeToken, maskPhone, normalizePhone, options, readJson, requireApiKey, requireDb, sendVerificationSms } from '../_shared/consent.js';
+import {
+  CONSENT_TEXT_VERSION,
+  errorJson,
+  enforceRequestRateLimit,
+  ensureSchema,
+  json,
+  makeToken,
+  normalizeContext,
+  normalizePhone,
+  options,
+  readJson,
+  requestMetadata,
+  requireApiKey,
+  requireDb,
+  sendVerificationSms,
+  sha256,
+  validateReturnUrl,
+} from "../_shared/consent.js";
 
-export async function onRequestOptions() { return options(); }
+export function onRequestOptions({ request }) {
+  return options(request);
+}
 
 export async function onRequestPost({ request, env }) {
   try {
-    requireApiKey(request, env);
+    await requireApiKey(request, env);
     const body = await readJson(request);
     const phone = normalizePhone(body.phone);
-    if (!phone) return json({ ok: false, error: 'Valid phone is required' }, 400);
-
-    const code = makeCode();
-    const token = makeToken();
-    const phoneMask = maskPhone(phone);
-    const consentLanguage = body.consentLanguage || 'By entering this code and selecting Opt In, I expressly consent to receive ClearKey SMS messages. Consent is not a condition of purchase. Message frequency varies. Message and data rates may apply. Reply STOP to cancel.';
-    const tenantSlug = body.tenantSlug || body.tenant || 'clearkey';
-    const source = body.source || 'external-app';
-    const origin = new URL(request.url).origin;
-    const verificationUrl = `${origin}/policy/sms-policy/opt-in?token=${encodeURIComponent(token)}`;
-
+    const returnUrl = validateReturnUrl(body.returnUrl);
+    if (!phone || !returnUrl) {
+      return json({ ok: false, error: "Valid phone and returnUrl are required" }, 400, request);
+    }
+    const app = normalizeContext(body.app, "clearkey", 64);
+    const tenantSlug = normalizeContext(body.tenantSlug, "clearkey", 100);
+    const purpose = normalizeContext(body.purpose, "marketing_sms", 64);
+    const popupRequested = body.popup === true;
+    const { ipAddress, userAgent } = requestMetadata(request);
     const sql = requireDb(env);
     await ensureSchema(sql);
+    await enforceRequestRateLimit(sql, phone, ipAddress);
+
+    const token = makeToken();
+    const tokenHash = await sha256(token);
+    const baseUrl = String(env.PUBLIC_CONSENT_BASE_URL || "https://legal.clearkey.solutions").replace(/\/$/, "");
+    const verificationUrl = `${baseUrl}/sms/verify/${encodeURIComponent(token)}${popupRequested ? "?popup=1" : ""}`;
     const rows = await sql`
       insert into sms_consent_requests
-        (token, tenant_slug, source, phone_e164, phone_mask, email, code_hash, consent_language, ip_address, user_agent, return_to)
+        (phone_e164, app, tenant_slug, return_url, purpose, verification_token_hash,
+         token_expires_at, consent_status, popup_requested, consent_text_version,
+         ip_address, user_agent, updated_at)
       values
-        (${token}, ${tenantSlug}, ${source}, ${phone}, ${phoneMask}, ${body.email || null}, ${await hashCode(code)}, ${consentLanguage}, ${request.headers.get('cf-connecting-ip') || ''}, ${request.headers.get('user-agent') || ''}, ${body.returnTo || null})
-      returning id, token, phone_mask, expires_at
+        (${phone}, ${app}, ${tenantSlug}, ${returnUrl}, ${purpose}, ${tokenHash},
+         now() + interval '30 minutes', 'pending', ${popupRequested}, ${CONSENT_TEXT_VERSION},
+         ${ipAddress}, ${userAgent}, now())
+      returning id, token_expires_at
     `;
-
-    const sms = await sendVerificationSms(env, { phone, code, verificationUrl, tenantSlug, source });
+    const sms = await sendVerificationSms(env, {
+      phone,
+      verificationUrl,
+      app,
+      tenantSlug,
+      purpose,
+    });
     await sql`
-      insert into sms_consent_events (request_id, tenant_slug, source, phone_e164, phone_mask, event_type, consent_language, ip_address, user_agent, metadata)
-      values (${rows[0].id}, ${tenantSlug}, ${source}, ${phone}, ${phoneMask}, 'verification_requested', ${consentLanguage}, ${request.headers.get('cf-connecting-ip') || ''}, ${request.headers.get('user-agent') || ''}, ${JSON.stringify({ sms })}::jsonb)
+      insert into sms_consent_events
+        (request_id, phone_e164, app, tenant_slug, purpose, event_type,
+         consent_status, consent_text_version, ip_address, user_agent, metadata)
+      values
+        (${rows[0].id}, ${phone}, ${app}, ${tenantSlug}, ${purpose},
+         'verification_requested', 'pending', ${CONSENT_TEXT_VERSION},
+         ${ipAddress}, ${userAgent}, ${JSON.stringify({ smsSent: sms.sent, senderStatus: sms.status || null })}::jsonb)
     `;
-
-    return json({ ok: true, token, verificationUrl, phoneMask, expiresAt: rows[0].expires_at, smsSent: sms.sent });
-  } catch (err) {
-    return json({ ok: false, error: err.message || 'Request failed' }, err.status || 500);
+    if (!sms.sent) {
+      return json({ ok: false, error: "Verification message could not be sent" }, 502, request);
+    }
+    return json(
+      { ok: true, verificationUrl, expiresAt: rows[0].token_expires_at },
+      200,
+      request,
+    );
+  } catch (error) {
+    return errorJson(error, "Verification request failed", request);
   }
 }

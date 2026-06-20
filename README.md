@@ -1,66 +1,68 @@
-# ClearKey Legal & Consent Center
+# ClearKey Legal and Consent Center
 
-React/Vite static legal center with Cloudflare Pages Functions for SMS consent verification and unsubscribe recording.
+Central legal policy hub and SMS consent service for all ClearKey applications.
 
-## Pages
+Canonical host: `https://legal.clearkey.solutions`
 
-- `/` legal/policy hub
-- `/consent-center` central redirect target for all ClearKey sites
-- `/policy/sms-policy/opt-in?token=...` confirmation form after another ClearKey app collects a phone number
-- `/policy/sms-policy/unsubscribe` unsubscribe form
-- `/policy/sms-policy/policy` SMS policy
-- `/<policy-slug>` renders documents from `src/policies.js`
+## User routes
 
-## API
+- `/sms/verify/:token`
+- `/sms/verify/:token?popup=1`
+- `/sms/unsubscribe`
+- `/policy/sms-policy/policy`
+- `/consent-center`
+- `/<policy-slug>`
 
-### `POST /api/sms/request-verification`
-Called by any ClearKey app after it collects a phone number.
+The popup verification page posts `CLEARKEY_SMS_CONSENT_COMPLETE` only to the exact validated origin of the stored return URL. If no opener is available, it redirects to the stored return URL with `smsConsent=opted_in` or `smsConsent=failed`.
 
-Headers:
-- `Authorization: Bearer $CONSENT_API_SECRET` or `x-clearkey-consent-key: $CONSENT_API_SECRET`
+## API routes
 
-Body:
+- `POST /api/sms/request-verification`
+- `POST /api/sms/lookup-verification`
+- `POST /api/sms/verify-opt-in`
+- `POST /api/sms/unsubscribe`
+
+`request-verification` is server-to-server and requires `Authorization: Bearer $CONSENT_API_SECRET` or `x-clearkey-consent-key`. It accepts:
+
 ```json
 {
-  "phone": "+15555550123",
-  "tenantSlug": "sweepr",
-  "source": "sweepr-booking-form",
-  "email": "optional@example.com",
-  "returnTo": "https://example.com/thanks"
+  "phone": "+15551234567",
+  "app": "connect",
+  "tenantSlug": "joes-plumbing",
+  "returnUrl": "https://connect.clearkey.solutions/settings/sms",
+  "purpose": "marketing_sms",
+  "popup": true
 }
 ```
 
-Returns:
-```json
-{
-  "ok": true,
-  "token": "...",
-  "verificationUrl": "https://cklegal.pages.dev/policy/sms-policy/opt-in?token=...",
-  "phoneMask": "•••-•••-0123",
-  "smsSent": true
-}
-```
+The response contains a short-lived `verificationUrl`; the raw token is never stored or returned separately.
 
-### `POST /api/sms/verify-opt-in`
-Called by the opt-in form with `{ "token": "...", "code": "123456" }`.
+## Environment
 
-### `POST /api/sms/unsubscribe`
-Called by the unsubscribe form with `{ "phone": "+15555550123", "tenantSlug": "clearkey" }`.
+- `DATABASE_URL`
+- `CONSENT_API_SECRET`
+- `SMS_WEBHOOK_URL=https://api.clearkey.solutions/sms/send`
+- `SMS_WEBHOOK_SECRET`
+- `PUBLIC_CONSENT_BASE_URL=https://legal.clearkey.solutions`
 
-## Cloudflare env vars
+Secrets must be configured as Cloudflare project secrets, never committed.
 
-Required:
-- `DATABASE_URL` Neon PostgreSQL connection string
+## Persistence
 
-Recommended:
-- `CONSENT_API_SECRET` shared API key used by ClearKey apps calling request-verification
-- `SMS_WEBHOOK_URL` endpoint for your actual SMS provider/send service
-- `SMS_WEBHOOK_SECRET` optional bearer token sent to the SMS webhook
+The Pages Functions maintain:
 
-## Neon tables
-
-The API auto-creates:
 - `sms_consent_requests`
+- `sms_consent_records`
 - `sms_consent_events`
 
-Keep `src/policies.js`; it contains the legal document array.
+Verification tokens are stored only as SHA-256 hashes. Requests expire after 30 minutes and are rate-limited by phone and IP.
+
+## Development
+
+```bash
+npm install
+npm test
+npm run build
+```
+
+Keep `src/policies.js`; it remains the legal policy source.
