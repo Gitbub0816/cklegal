@@ -1,0 +1,13 @@
+# robots.txt — ClearKey Solutions
+# https://clearkey.solutions/robots.txt
+
+User-agent: *
+Allow: /
+
+Disallow: /admin/
+Disallow: /admin
+Disallow: /api/
+Disallow: /*.json$
+Disallow: /src/
+
+Sitemap: https://clearkey.solutions/sitemap.xml
