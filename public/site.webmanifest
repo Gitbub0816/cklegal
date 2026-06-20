@@ -1,0 +1,9 @@
+{
+  "name": "ClearKey Legal & Consent Center",
+  "short_name": "ClearKey Legal",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FDFCF8",
+  "theme_color": "#C9A033",
+  "icons": []
+}

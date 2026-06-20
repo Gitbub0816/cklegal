@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://cklegal.pages.dev/sitemap.xml
