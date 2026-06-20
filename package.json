@@ -16,5 +16,8 @@
     "react-dom": "latest",
     "@neondatabase/serverless": "^0.10.4"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@emnapi/core": "1.11.1",
+    "@emnapi/runtime": "1.11.1"
+  }
 }
